@@ -60,6 +60,7 @@ def setup(
         min_lr=4e-5,
         lr_warmup_steps=2000,
         tie_embeddings=False,
+        compile=True
     ),
     eval: EvalArgs = EvalArgs(interval=1000, max_iters=100),
     optimizer: Union[str, Dict] = "AdamW",
@@ -204,7 +205,8 @@ def main(
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters: {num_parameters(model):,}")
 
-    model = torch.compile(model)
+    if train.compile:
+        model = torch.compile(model)
     model = fabric.setup(model)
 
     extra_kwargs = {"fused": fabric.device.type == "cuda"}
@@ -234,7 +236,7 @@ def main(
     fit(fabric, devices, state, train_dataloader, val_dataloader, out_dir, tokenizer_dir, train, eval)
 
     # Save final checkpoint
-    save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
+#    save_checkpoint(fabric, state, tokenizer_dir, out_dir / "final" / "lit_model.pth")
 
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
@@ -267,7 +269,7 @@ def fit(
 
     with torch.device("meta"):
         meta_model = GPT(model.config)
-        x = torch.randint(0, 1, (train.micro_batch_size, meta_model.max_seq_length))
+        x = torch.randint(0, 1, (train.micro_batch_size, model.max_seq_length))
         model_fwd = lambda: meta_model(x)
         model_loss = lambda y: chunked_cross_entropy(y, x, chunk_size=0)
         measured_flops = measure_flops(meta_model, model_fwd, model_loss)
@@ -277,7 +279,7 @@ def fit(
     max_tokens_per_device = train.max_tokens // fabric.world_size
     tokens_per_iter = train.micro_batch_size * model.max_seq_length
     max_iters = max_tokens_per_device // tokens_per_iter
-    log_iter_interval = train.log_interval * train.gradient_accumulation_iters(devices)
+    log_iter_interval = train.log_interval #* train.gradient_accumulation_iters(devices)
     initial_iter = state["iter_num"]
     train_iterator = CycleIterator(train_dataloader)
 
@@ -285,6 +287,17 @@ def fit(
         fabric.device
     )
     fabric.barrier()
+
+    # Warmup forward to run torch.compile separately
+    input_ids = torch.randint(
+            0, 1, (train.micro_batch_size, model.max_seq_length)
+    ).long().cuda()
+    logits = model(input_ids)
+    loss = chunked_cross_entropy(logits, input_ids)
+    fabric.backward(loss / train.gradient_accumulation_iters(devices))
+    optimizer.zero_grad()
+    fabric.barrier()
+
     total_t0 = time.perf_counter()
 
     warmup_iters = train.warmup_iters(devices, max_iters, train_dataloader)
@@ -367,15 +380,15 @@ def fit(
             fabric.log_dict(metrics, step=state["iter_num"] - 1)
             fabric.barrier()
 
-        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
-            save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
-
-    # Final validation
-    if eval.final_validation:
-        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
-        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
-        fabric.log_dict(metrics, step=state["iter_num"])
-        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
+#        if train.save_interval is not None and not is_accumulating and state["step_count"] % train.save_interval == 0:
+#            save_checkpoint(fabric, state, tokenizer_dir, out_dir / f"step-{state['step_count']:08d}" / "lit_model.pth")
+#
+#    # Final validation
+#    if eval.final_validation:
+#        val_loss = validate(fabric, model, val_dataloader, max_iters=eval.max_iters)
+#        metrics = {"val_loss": val_loss, "val_ppl": math.exp(val_loss)}
+#        fabric.log_dict(metrics, step=state["iter_num"])
+#        fabric.print(f"Final evaluation | val loss: {val_loss.item():.3f} | val ppl: {math.exp(val_loss):.3f}")
 
 
 @torch.no_grad()
